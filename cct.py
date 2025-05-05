@@ -356,6 +356,17 @@ def train_val(config, model, train_loader, val_loader, criterion):
     file_log.flush()
     print('Complete training ---------------------------------------------------- \n The best epoch is {}'.format(best_epoch))
 
+    # Lưu folder checkpoints lên wandb sử dụng Artifacts
+    checkpoint_dir = f"checkpoints/{config.data.name}/{args.exp}_{config.data.supervised_ratio}/fold{args.fold}"
+    artifact = wandb.Artifact(
+        name=f"{args.exp}_{config.data.supervised_ratio}_fold{args.fold}",
+        type="model",
+        description=f"Model checkpoints for {args.exp} with {config.data.supervised_ratio} supervised ratio, fold {args.fold}"
+    )
+    artifact.add_dir(checkpoint_dir)
+    wandb.log_artifact(artifact)
+    print(f"Saved checkpoints to wandb artifacts from {checkpoint_dir}")
+
     return 
 
 
