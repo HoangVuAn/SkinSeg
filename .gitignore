@@ -1,0 +1,5 @@
+checkpoints
+data
+__pycache____pycache__/
+wandb
+processed_data
