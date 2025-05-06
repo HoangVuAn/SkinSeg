@@ -30,7 +30,7 @@ torch.cuda.empty_cache()
 
 def main(config):
     
-    wandb.init(project="SkinSeg", name="CCT_2_fold1", config=config)
+    wandb.init(project="SkinSeg", name=f"CCT_2_fold{config.fold}", config=config)
     
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
