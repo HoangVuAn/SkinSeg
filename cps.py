@@ -275,7 +275,7 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
                 
 
         # print
-        file_log('Epoch {}, Total train step {} || AVG_loss: {}, Avg Dice score 1: {}, Avg IOU 1: {}, Avg Dice score 2: {}, Avg IOU 2: {}\n'.format(
+        file_log.write('Epoch {}, Total train step {} || AVG_loss: {}, Avg Dice score 1: {}, Avg IOU 1: {}, Avg Dice score 2: {}, Avg IOU 2: {}\n'.format(
             epoch, 
             iter, 
             round(loss_train_sum / num_train,5), 
