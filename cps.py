@@ -8,6 +8,8 @@ import yaml
 import os, time
 from datetime import datetime
 import cv2
+import wandb
+import torch
 
 import pandas as pd
 import torch.nn as nn
@@ -19,7 +21,7 @@ from Datasets.create_dataset import *
 from Datasets.transform import normalize
 from Utils.losses import dice_loss
 from Utils.pieces import DotDict
-from Utils.functions import fix_all_seed
+from Utils.functions import fix_all_seed, segmentation_metrics
 
 from Models.Transformer.SwinUnet import SwinUnet
 from itertools import cycle
@@ -27,6 +29,8 @@ from itertools import cycle
 torch.cuda.empty_cache()
 
 def main(config):
+    
+    wandb.init(project="SkinSeg", name=f"CPS_2_fold{config.fold}", config=config)
     
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
@@ -143,6 +147,14 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         loss_train_sum = 0
         num_train = 0
         iter = 0
+        bce_sup_loss_sum_1 = 0
+        dice_sup_loss_sum_1 = 0
+        bce_unsup_loss_sum_1 = 0
+        dice_unsup_loss_sum_1 = 0
+        bce_sup_loss_sum_2 = 0
+        dice_sup_loss_sum_2 = 0
+        bce_unsup_loss_sum_2 = 0
+        dice_unsup_loss_sum_2 = 0
         source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'])
         for idx, (batch, batch_w_s) in enumerate(source_dataset):
             img = batch['image'].cuda().float()
@@ -226,6 +238,18 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
                 dice_train_sum_2 += dice_train_2 * sup_batch_len
                 iou_train_sum_2 += iou_train_2 * sup_batch_len
                 
+            # Cộng dồn loss thành phần cho model 1
+            bce_sup_loss_sum_1 += losses_l1[0].item() * sup_batch_len
+            dice_sup_loss_sum_1 += losses_l1[1].item() * sup_batch_len
+            bce_unsup_loss_sum_1 += losses_u1[0].item() * sup_batch_len
+            dice_unsup_loss_sum_1 += losses_u1[1].item() * sup_batch_len
+            
+            # Cộng dồn loss thành phần cho model 2
+            bce_sup_loss_sum_2 += losses_l2[0].item() * sup_batch_len
+            dice_sup_loss_sum_2 += losses_l2[1].item() * sup_batch_len
+            bce_unsup_loss_sum_2 += losses_u2[0].item() * sup_batch_len
+            dice_unsup_loss_sum_2 += losses_u2[1].item() * sup_batch_len
+            
             file_log.write('Epoch {}, iter {}:\n'.format(epoch, iter + 1))
             file_log.write('Dice Sup Loss 1: {}, Dice Unsup Loss 1: {}, BCE Sup Loss 1: {}, BCE UnSup Loss 1: {}\n'.format(
                 round(losses_l1[1].item(), 5), round(losses_u1[1].item(), 5), round(losses_l1[0].item(), 5), round(losses_u1[0].item(), 5)
@@ -279,6 +303,10 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         iou_val_sum = 0
         loss_val_sum = 0
         num_val = 0
+        acc_val_sum = 0
+        sen_val_sum = 0
+        spe_val_sum = 0
+        pre_val_sum = 0
 
         for batch_id, batch in enumerate(val_loader):
             img = batch['image'].cuda().float()
@@ -299,10 +327,19 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
                 loss_val_sum += sum(losses)*batch_len / 2
 
                 # calculate metrics
-                output = output.cpu().numpy() > 0.5
-                label = label.cpu().numpy()
-                dice_val_sum += metrics.dc(output, label)*batch_len
-                iou_val_sum += metrics.jc(output, label)*batch_len
+                output_np = output.cpu().numpy() > 0.5
+                label_np = label.cpu().numpy()
+                dice_val_sum += metrics.dc(output_np, label_np)*batch_len
+                iou_val_sum += metrics.jc(output_np, label_np)*batch_len
+
+                # Tính các metrics segmentation cho val (dùng tensor float)
+                output_bin = (output > 0.5).float().cpu()
+                label_bin = label.float().cpu()
+                seg_metrics = segmentation_metrics(output_bin, label_bin)
+                acc_val_sum += seg_metrics['ACC'] * batch_len
+                sen_val_sum += seg_metrics['SEN'] * batch_len
+                spe_val_sum += seg_metrics['SPE'] * batch_len
+                pre_val_sum += seg_metrics['PRE'] * batch_len
 
                 num_val += batch_len
                 # end one val batch
@@ -310,7 +347,11 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
 
         # logging per epoch for one dataset
         loss_val_epoch, dice_val_epoch, iou_val_epoch = loss_val_sum/num_val, dice_val_sum/num_val, iou_val_sum/num_val
-
+        acc_val_epoch = acc_val_sum / num_val
+        sen_val_epoch = sen_val_sum / num_val
+        spe_val_epoch = spe_val_sum / num_val
+        pre_val_epoch = pre_val_sum / num_val
+        
         # print
         file_log.write('Epoch {}, Model 1, Validation || sum_loss: {}, Dice score: {}, IOU: {}\n'.
                 format(epoch, round(loss_val_epoch.item(),5), 
@@ -332,6 +373,10 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         iou_val_sum = 0
         loss_val_sum = 0
         num_val = 0
+        acc_val_sum = 0
+        sen_val_sum = 0
+        spe_val_sum = 0
+        pre_val_sum = 0
 
         for batch_id, batch in enumerate(val_loader):
             img = batch['image'].cuda().float()
@@ -352,10 +397,19 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
                 loss_val_sum += sum(losses)*batch_len / 2
 
                 # calculate metrics
-                output = output.cpu().numpy() > 0.5
-                label = label.cpu().numpy()
-                dice_val_sum += metrics.dc(output, label)*batch_len
-                iou_val_sum += metrics.jc(output, label)*batch_len
+                output_np = output.cpu().numpy() > 0.5
+                label_np = label.cpu().numpy()
+                dice_val_sum += metrics.dc(output_np, label_np)*batch_len
+                iou_val_sum += metrics.jc(output_np, label_np)*batch_len
+
+                # Tính các metrics segmentation cho val (dùng tensor float)
+                output_bin = (output > 0.5).float().cpu()
+                label_bin = label.float().cpu()
+                seg_metrics = segmentation_metrics(output_bin, label_bin)
+                acc_val_sum += seg_metrics['ACC'] * batch_len
+                sen_val_sum += seg_metrics['SEN'] * batch_len
+                spe_val_sum += seg_metrics['SPE'] * batch_len
+                pre_val_sum += seg_metrics['PRE'] * batch_len
 
                 num_val += batch_len
                 # end one val batch
@@ -363,7 +417,11 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
 
         # logging per epoch for one dataset
         loss_val_epoch, dice_val_epoch, iou_val_epoch = loss_val_sum/num_val, dice_val_sum/num_val, iou_val_sum/num_val
-
+        acc_val_epoch = acc_val_sum / num_val
+        sen_val_epoch = sen_val_sum / num_val
+        spe_val_epoch = spe_val_sum / num_val
+        pre_val_epoch = pre_val_sum / num_val
+        
         # print
         file_log.write('Epoch {}, Model 2, Validation || sum_loss: {}, Dice score: {}, IOU: {}\n'.
                 format(epoch, round(loss_val_epoch.item(),5), 
@@ -406,11 +464,55 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
 
         # end one epoch
         if config.debug: return
+
+        wandb.log({
+            "train/loss": loss_train_sum / num_train,
+            "train/dice_1": dice_train_sum_1 / num_train,
+            "train/iou_1": iou_train_sum_1 / num_train,
+            "train/dice_2": dice_train_sum_2 / num_train,
+            "train/iou_2": iou_train_sum_2 / num_train,
+            "train/bce_sup_loss_1": bce_sup_loss_sum_1 / num_train,
+            "train/dice_sup_loss_1": dice_sup_loss_sum_1 / num_train,
+            "train/bce_unsup_loss_1": bce_unsup_loss_sum_1 / num_train,
+            "train/dice_unsup_loss_1": dice_unsup_loss_sum_1 / num_train,
+            "train/bce_sup_loss_2": bce_sup_loss_sum_2 / num_train,
+            "train/dice_sup_loss_2": dice_sup_loss_sum_2 / num_train,
+            "train/bce_unsup_loss_2": bce_unsup_loss_sum_2 / num_train,
+            "train/dice_unsup_loss_2": dice_unsup_loss_sum_2 / num_train,
+            "val/loss_1": loss_val_epoch.item(),
+            "val/dice_1": avg_dice_1,
+            "val/iou_1": avg_iou_1,
+            "val/acc_1": acc_val_epoch,
+            "val/sensitivity_1": sen_val_epoch,
+            "val/specificity_1": spe_val_epoch,
+            "val/precision_1": pre_val_epoch,
+            "val/loss_2": loss_val_epoch.item(),
+            "val/dice_2": avg_dice_2,
+            "val/iou_2": avg_iou_2,
+            "val/acc_2": acc_val_epoch,
+            "val/sensitivity_2": sen_val_epoch,
+            "val/specificity_2": spe_val_epoch,
+            "val/precision_2": pre_val_epoch,
+            "epoch": epoch,
+            "lr_1": scheduler1.get_last_lr()[0],
+            "lr_2": scheduler2.get_last_lr()[0]
+        })
     
     file_log.write('Complete training ---------------------------------------------------- \n The best epoch is {}\n'.format(best_epoch))
     file_log.flush()
     
     print('Complete training ---------------------------------------------------- \n The best epoch is {}'.format(best_epoch))
+
+    # Lưu folder checkpoints lên wandb sử dụng Artifacts
+    checkpoint_dir = f"checkpoints/{config.data.name}/{args.exp}_{config.data.supervised_ratio}/fold{args.fold}"
+    artifact = wandb.Artifact(
+        name=f"{args.exp}_{config.data.supervised_ratio}_fold{args.fold}",
+        type="model",
+        description=f"Model checkpoints for {args.exp} with {config.data.supervised_ratio} supervised ratio, fold {args.fold}"
+    )
+    artifact.add_dir(checkpoint_dir)
+    wandb.log_artifact(artifact)
+    print(f"Saved checkpoints to wandb artifacts from {checkpoint_dir}")
 
     return model
 
@@ -425,6 +527,10 @@ def test(config, model, model_dir, test_loader, criterion):
     iou_test_sum = 0
     loss_test_sum = 0
     num_test = 0
+    acc_test_sum = 0
+    sen_test_sum = 0
+    spe_test_sum = 0
+    pre_test_sum = 0
     for batch_id, batch in enumerate(test_loader):
         img = batch['image'].cuda().float()
         label = batch['label'].cuda().float()
@@ -445,10 +551,19 @@ def test(config, model, model_dir, test_loader, criterion):
             loss_test_sum += sum(losses)*batch_len
 
             # calculate metrics
-            output = output.cpu().numpy() > 0.5
-            label = label.cpu().numpy()
-            dice_test_sum += metrics.dc(output, label)*batch_len
-            iou_test_sum += metrics.jc(output, label)*batch_len
+            output_np = output.cpu().numpy() > 0.5
+            label_np = label.cpu().numpy()
+            dice_test_sum += metrics.dc(output_np, label_np)*batch_len
+            iou_test_sum += metrics.jc(output_np, label_np)*batch_len
+
+            # Tính các metrics segmentation cho test (dùng tensor float)
+            output_bin = (output > 0.5).float().cpu()
+            label_bin = label.float().cpu()
+            seg_metrics = segmentation_metrics(output_bin, label_bin)
+            acc_test_sum += seg_metrics['ACC'] * batch_len
+            sen_test_sum += seg_metrics['SEN'] * batch_len
+            spe_test_sum += seg_metrics['SPE'] * batch_len
+            pre_test_sum += seg_metrics['PRE'] * batch_len
 
             num_test += batch_len
             # end one test batch
@@ -456,7 +571,10 @@ def test(config, model, model_dir, test_loader, criterion):
 
     # logging results for one dataset
     loss_test_epoch, dice_test_epoch, iou_test_epoch = loss_test_sum/num_test, dice_test_sum/num_test, iou_test_sum/num_test
-
+    acc_test_epoch = acc_test_sum / num_test
+    sen_test_epoch = sen_test_sum / num_test
+    spe_test_epoch = spe_test_sum / num_test
+    pre_test_epoch = pre_test_sum / num_test
 
     # logging average and store results
     with open(test_results_dir, 'w') as f:
@@ -473,6 +591,16 @@ def test(config, model, model_dir, test_loader, criterion):
     print('Test || Average loss: {}, Dice score: {}, IOU: {}'.
             format(round(loss_test_epoch.item(),5), 
             round(dice_test_epoch,4), round(iou_test_epoch,4)))
+
+    wandb.log({
+        "test/loss": loss_test_epoch.item(),
+        "test/dice": dice_test_epoch,
+        "test/iou": iou_test_epoch,
+        "test/acc": acc_test_epoch,
+        "test/sensitivity": sen_test_epoch,
+        "test/specificity": spe_test_epoch,
+        "test/precision": pre_test_epoch
+    })
 
     return
 
