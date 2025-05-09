@@ -8,6 +8,8 @@ import yaml
 import os, time
 from datetime import datetime
 import cv2
+import wandb
+import torch
 
 import numpy as np
 import pandas as pd
@@ -21,7 +23,7 @@ from Datasets.unimatch import *
 from Datasets.transform import normalize
 from Utils.losses import dice_loss
 from Utils.pieces import DotDict
-from Utils.functions import fix_all_seed
+from Utils.functions import fix_all_seed, segmentation_metrics
 
 from Models.Transformer.SwinUnetUni import SwinUnet
 from itertools import cycle
@@ -29,6 +31,8 @@ from itertools import cycle
 torch.cuda.empty_cache()
 
 def main(config):
+    
+    wandb.init(project="SkinSeg", name=f"UniMatch_fold{config.fold}", config=config)
     
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
@@ -143,6 +147,10 @@ def train_val(config, model, train_loader, val_loader, criterion):
         loss_train_sum = 0
         num_train = 0
         iter = 0
+        bce_sup_loss_sum = 0
+        dice_sup_loss_sum = 0
+        bce_unsup_loss_sum = 0
+        dice_unsup_loss_sum = 0
         source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'], train_loader['u_loader'])
         for idx, (batch, 
                  (img_u_w, img_u_s1, img_u_s2, cutmix_box1, cutmix_box2),
@@ -279,7 +287,11 @@ def train_val(config, model, train_loader, val_loader, criterion):
                                                                                                       round(dice_train_sum/num_train,4), 
                                                                                                       round(iou_train_sum/num_train,4)))
             
-
+        # Tính trung bình loss thành phần
+        avg_bce_sup_loss = bce_sup_loss_sum / num_train
+        avg_dice_sup_loss = dice_sup_loss_sum / num_train
+        avg_bce_unsup_loss = bce_unsup_loss_sum / num_train
+        avg_dice_unsup_loss = dice_unsup_loss_sum / num_train
 
         # -----------------------------------------------------------------
         # validate
@@ -290,6 +302,10 @@ def train_val(config, model, train_loader, val_loader, criterion):
         iou_val_sum = 0
         loss_val_sum = 0
         num_val = 0
+        acc_val_sum = 0
+        sen_val_sum = 0
+        spe_val_sum = 0
+        pre_val_sum = 0
 
         for batch_id, batch in enumerate(val_loader):
             img = batch['image'].cuda().float()
@@ -310,10 +326,19 @@ def train_val(config, model, train_loader, val_loader, criterion):
                 loss_val_sum += sum(losses)*batch_len
 
                 # calculate metrics
-                output = output.cpu().numpy() > 0.5
-                label = label.cpu().numpy()
-                dice_val_sum += metrics.dc(output, label)*batch_len
-                iou_val_sum += metrics.jc(output, label)*batch_len
+                output_np = output.cpu().numpy() > 0.5
+                label_np = label.cpu().numpy()
+                dice_val_sum += metrics.dc(output_np, label_np)*batch_len
+                iou_val_sum += metrics.jc(output_np, label_np)*batch_len
+
+                # Tính các metrics segmentation cho val (dùng tensor float)
+                output_bin = (output > 0.5).float().cpu()
+                label_bin = label.float().cpu()
+                seg_metrics = segmentation_metrics(output_bin, label_bin)
+                acc_val_sum += seg_metrics['ACC'] * batch_len
+                sen_val_sum += seg_metrics['SEN'] * batch_len
+                spe_val_sum += seg_metrics['SPE'] * batch_len
+                pre_val_sum += seg_metrics['PRE'] * batch_len
 
                 num_val += batch_len
                 # end one val batch
@@ -321,6 +346,10 @@ def train_val(config, model, train_loader, val_loader, criterion):
 
         # logging per epoch for one dataset
         loss_val_epoch, dice_val_epoch, iou_val_epoch = loss_val_sum/num_val, dice_val_sum/num_val, iou_val_sum/num_val
+        acc_val_epoch = acc_val_sum / num_val
+        sen_val_epoch = sen_val_sum / num_val
+        spe_val_epoch = spe_val_sum / num_val
+        pre_val_epoch = pre_val_sum / num_val
 
         # print
         file_log.write('Epoch {}, Validation || sum_loss: {}, Dice score: {}, IOU: {}\n'.
@@ -355,10 +384,40 @@ def train_val(config, model, train_loader, val_loader, criterion):
 
         # end one epoch
         if config.debug: return
+
+        wandb.log({
+            "train/loss": loss_train_sum / num_train,
+            "train/dice": dice_train_sum / num_train,
+            "train/iou": iou_train_sum / num_train,
+            "train/bce_sup_loss": avg_bce_sup_loss,
+            "train/dice_sup_loss": avg_dice_sup_loss,
+            "train/bce_unsup_loss": avg_bce_unsup_loss,
+            "train/dice_unsup_loss": avg_dice_unsup_loss,
+            "val/loss": loss_val_epoch.item(),
+            "val/dice": dice_val_epoch,
+            "val/iou": iou_val_epoch,
+            "val/acc": acc_val_epoch,
+            "val/sensitivity": sen_val_epoch,
+            "val/specificity": spe_val_epoch,
+            "val/precision": pre_val_epoch,
+            "epoch": epoch,
+            "lr": scheduler.get_last_lr()[0]
+        })
     
     file_log.write('Complete training ---------------------------------------------------- \n The best epoch is {}\n'.format(best_epoch))
     file_log.flush()
     print('Complete training ---------------------------------------------------- \n The best epoch is {}'.format(best_epoch))
+
+    # Lưu folder checkpoints lên wandb sử dụng Artifacts
+    checkpoint_dir = f"checkpoints/{config.data.name}/{args.exp}_{config.data.supervised_ratio}/fold{args.fold}"
+    artifact = wandb.Artifact(
+        name=f"{args.exp}_{config.data.supervised_ratio}_fold{args.fold}",
+        type="model",
+        description=f"Model checkpoints for {args.exp} with {config.data.supervised_ratio} supervised ratio, fold {args.fold}"
+    )
+    artifact.add_dir(checkpoint_dir)
+    wandb.log_artifact(artifact)
+    print(f"Saved checkpoints to wandb artifacts from {checkpoint_dir}")
 
     return 
 
@@ -420,8 +479,12 @@ def test(config, model, model_dir, test_loader, criterion):
     print('Test || Average loss: {}, Dice score: {}, IOU: {}'.
             format(round(loss_test_epoch.item(),5), 
             round(dice_test_epoch,4), round(iou_test_epoch,4)))
-    if config.log == True:
-        wandb.log({'Test/loss': loss_test_epoch.item(), 'Test/Dice_score': dice_test_epoch, 'Test/IOU': iou_test_epoch})
+
+    wandb.log({
+        "test/loss": loss_test_epoch.item(),
+        "test/dice": dice_test_epoch,
+        "test/iou": iou_test_epoch
+    })
 
     return
 
