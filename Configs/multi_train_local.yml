@@ -13,7 +13,7 @@ data:
   train_aug: True
   img_size: 224
 semi:
-  conf_thresh: 0.7 # cho giong paper
+  conf_thresh: 0.85 # cho giong paper
 train:
   l_batchsize: 8
   u_batchsize: 8
