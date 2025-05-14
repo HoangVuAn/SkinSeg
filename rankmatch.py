@@ -261,7 +261,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
             batch_len = img.shape[0]
 
             with torch.no_grad():
-                output, _, _, _ = model(img)
+                output = model(img)
                     
                 output = torch.sigmoid(output)
 
@@ -390,7 +390,7 @@ def test(config, model, model_dir, test_loader, criterion):
             
         with torch.no_grad():
                 
-            output, _, _, _ = model(img)
+            output = model(img)
 
             output = torch.sigmoid(output)
 
