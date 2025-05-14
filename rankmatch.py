@@ -23,15 +23,15 @@ from Utils.losses import dice_loss, corr_loss
 from Utils.pieces import DotDict
 from Utils.functions import fix_all_seed, segmentation_metrics
 
-from Models.Transformer.SwinUnetCCT4 import SwinUnet
+from Models.Transformer.SwinUnetUni import SwinUnet
 from itertools import cycle
 
 torch.cuda.empty_cache()
 
 def main(config):
     
-    wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
-    # wandb.init(mode="disabled")
+    # wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
+    wandb.init(mode="disabled")
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
                                                     train_aug=config.data.train_aug,
@@ -150,7 +150,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
             unsup_batch_len = weak_batch.shape[0]
             
             # chỉ lấy nhánh main để tính
-            output, _, _, _ = model(img)
+            output = model(img)
             output = torch.sigmoid(output)
             
             # calculate loss
@@ -162,8 +162,8 @@ def train_val(config, model, train_loader, val_loader, criterion):
             # RankMatch
             #======================================================================================================
             # outputs for model
-            feat_w, _, _, _ = model(weak_batch)
-            feat_s, _, _, _ = model(strong_batch)
+            feat_w = model(weak_batch)
+            feat_s = model(strong_batch)
 
             outputs_weak_soft = torch.sigmoid(feat_w)
             outputs_strong_soft = torch.sigmoid(feat_s)
