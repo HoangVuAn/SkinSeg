@@ -3,6 +3,133 @@ from torch.nn import functional as F
 import numpy as np
 from scipy.ndimage import distance_transform_edt as distance
 from skimage import segmentation as skimage_seg
+from itertools import permutations
+
+
+def corr_loss(feat_w, feat_s):
+    """
+    Compute correlation loss between weak and strong features
+    Args:
+        feat_w: weak features
+        feat_s: strong features
+    Returns:
+        correlation loss
+    """
+    def orthogonal_landmarks(q, q_s, num_landmarks=64, subsample_fraction=1.0):
+        """
+        Construct set of landmarks by recursively selecting new landmarks 
+        that are maximally orthogonal to the existing set.
+        Returns near orthogonal landmarks with shape (B, M, D).
+        """
+        B, D, H, W = q.shape
+        N = H * W
+        q = q.permute(0, 2, 3, 1).reshape(B, -1, D)
+        q_s = q_s.permute(0, 2, 3, 1).reshape(B, -1, D)
+
+        # ignore_mask = F.interpolate(ignore_mask.unsqueeze(1), size=(H, W), mode="nearest").squeeze(1)
+        # nonignore_mask = nonignore_mask.reshape(B, -1)
+
+        if subsample_fraction < 1.0:
+            # Need at least M/2 samples of queries and keys
+            num_samples = max(int(subsample_fraction * q.size(-2)), num_landmarks)
+            q_unnormalised = q[:, torch.randint(q.size(-2), (num_samples,), device=q.device), :] # (B, N, D)
+        else:
+            # (B, N, D)
+            q_unnormalised = q
+
+        # may need to change default eps to eps=1e-8 for mixed precision compatibility
+        qk = F.normalize(q_unnormalised, p=2, dim=-1)
+        # B, N, D = qk.shape
+
+        selected_mask = torch.zeros((B, N, 1), device=qk.device)
+        landmark_mask = torch.ones((B, 1, 1), dtype=selected_mask.dtype, device=qk.device)
+
+        # Get initial random landmark
+        random_idx = torch.randint(qk.size(-2), (B, 1, 1), device=qk.device)
+        # random_idx = torch.empty((B, 1, 1), dtype=torch.long, device=qk.device)
+        # for i in range(B):
+        #     nonignore_indices = torch.nonzero(nonignore_mask[i])
+        #     selected_index = nonignore_indices[torch.randint(0, nonignore_indices.size(0), (1,))]
+        #     random_idx[i, 0, 0] = selected_index.item()
+
+        selected_landmark = qk[torch.arange(qk.size(0)), random_idx.view(-1), :].view(B, D)
+        selected_mask.scatter_(-2, random_idx, landmark_mask)
+
+        # Selected landmarks
+        selected_landmarks = torch.empty((B, num_landmarks, D), device=qk.device, dtype=qk.dtype)
+        selected_landmarks[:, 0, :] = selected_landmark
+
+        # Store computed cosine similarities
+        cos_sims = torch.empty((B, N, num_landmarks), device=qk.device, dtype=qk.dtype)
+
+        for M in range(1, num_landmarks):
+            # Calculate absolute cosine similarity between selected and unselected landmarks
+            # (B, N, D) * (B, D) -> (B, N)
+            cos_sim = torch.einsum('b n d, b d -> b n', qk, selected_landmark).abs()
+            # # set cosine similarity for ignore mask to > 1
+            # cos_sim.view(-1)[nonignore_mask.flatten() == False] = 10
+            cos_sims[:, :, M - 1] = cos_sim
+            # (B, N, M) cosine similarities of current set of landmarks wrt all queries and keys
+            cos_sim_set = cos_sims[:, :, :M]
+
+            # Get orthogonal landmark: landmark with smallest absolute cosine similarity:
+            # set cosine similarity for already selected landmarks to > 1
+            cos_sim_set.view(-1, M)[selected_mask.flatten().bool(), :] = 10
+            # (B,) - want max for non
+            selected_landmark_idx = cos_sim_set.amax(-1).argmin(-1)
+            selected_landmark = qk[torch.arange(qk.size(0)), selected_landmark_idx, :].view(B, D)
+
+            # Add most orthogonal landmark to selected landmarks: 
+            selected_landmarks[:, M, :] = selected_landmark
+
+            # Removed selected indices from non-selected mask: 
+            selected_mask.scatter_(-2, selected_landmark_idx.unsqueeze(-1).unsqueeze(-1), landmark_mask)
+
+        landmarks = torch.masked_select(q_unnormalised, selected_mask.bool()).reshape(B, -1, D) # (B, M, D)
+        landmarks_s = torch.masked_select(q_s, selected_mask.bool()).reshape(B, -1, D)
+
+        return landmarks, landmarks_s # (B, M, D)
+    
+    def prob2rank(prob, prob_s, k=4):
+        """
+        input: prob(probability) [b, h, w, n]
+        return: rank [b, h, w, k!]
+        To save the computing resources, use top-k ranther than n
+        """
+        full_permutation = [c for c in permutations(range(k))]
+        full_permutation = torch.from_numpy(np.stack(full_permutation)) # [k!, k]
+
+        _, prob_topk_index = prob.topk(k, dim=-1) # [b, h, w, k]
+        A = prob_topk_index[:, :, :, full_permutation] # [b, h, w, k!, k]
+        B = prob.unsqueeze(3).expand(-1, -1, -1, full_permutation.shape[0], -1) # [b, h, w, k!, n]
+        B_s = prob_s.unsqueeze(3).expand(-1, -1, -1, full_permutation.shape[0], -1)
+        C = torch.gather(input=B, dim=-1, index=A) # [b, h, w, k!, k]
+        C_s = torch.gather(input=B_s, dim=-1, index=A)
+
+        rank = C[:, :, :, :, 0] / (C[:, :, :, :, 0:].sum(dim=-1) + 1e-10) # [b, h, w, k!]
+        rank_s = C_s[:, :, :, :, 0] / (C_s[:, :, :, :, 0:].sum(dim=-1) + 1e-10)
+
+        for i in range(1, k):
+            rank *= C[:, :, :, :, i] / (C[:, :, :, :, i:].sum(dim=-1) + 1e-10)
+            rank_s *= C_s[:, :, :, :, i] / (C_s[:, :, :, :, i:].sum(dim=-1) + 1e-10)
+
+        return rank, rank_s
+
+
+    criterion_c = torch.nn.KLDivLoss(reduction='mean') # pixel-reference correlation criterion
+
+    num_landmarks = 64
+
+    refers_w, refers_s = orthogonal_landmarks(feat_w, feat_s, num_landmarks)
+
+    p2r_w = torch.einsum('b c h w, b n c -> b h w n', feat_w, refers_w).softmax(dim=-1)
+    p2r_s = torch.einsum('b c h w, b n c -> b h w n', feat_s, refers_s).softmax(dim=-1)
+
+    p2r_w_rank, p2r_s_rank = prob2rank(p2r_w, p2r_s)
+
+    loss = criterion_c((p2r_s_rank + 1e-10).log(), p2r_w_rank)
+
+    return loss
 
 
 def dice_loss(score, target):
