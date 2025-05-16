@@ -32,8 +32,8 @@ torch.cuda.empty_cache()
 
 def main(config):
     
-    # wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
-    wandb.init(mode="disabled")
+    wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
+    # wandb.init(mode="disabled")
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
                                                     train_aug=config.data.train_aug,
