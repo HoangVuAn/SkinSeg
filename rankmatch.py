@@ -13,11 +13,13 @@ import torch
 
 import pandas as pd
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
 import torch.optim as optim
 import medpy.metric.binary as metrics
 
 from Datasets.create_dataset import *
+from Datasets.rankmatch import *
 from Datasets.transform import normalize
 from Utils.losses import dice_loss, corr_loss
 from Utils.pieces import DotDict
@@ -36,7 +38,7 @@ def main(config):
                                                     supervised_ratio=config.data.supervised_ratio, 
                                                     train_aug=config.data.train_aug,
                                                     k=config.fold,
-                                                    ulb_dataset=StrongWeakAugment2,
+                                                    ulb_dataset=SemiDataset,
                                                     lb_dataset=SkinDataset2)
 
     l_train_loader = torch.utils.data.DataLoader(dataset['lb_dataset'],
@@ -139,101 +141,188 @@ def train_val(config, model, train_loader, val_loader, criterion):
         bce_unsup_loss_sum = 0
         dice_unsup_loss_sum = 0
         corr_unsup_loss_sum = 0
-        source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'])
-        for idx, (batch, batch_w_s) in enumerate(source_dataset):
-            img = batch['image'].cuda().float()
-            label = batch['label'].cuda().float()
-            weak_batch = batch_w_s['img_w'].cuda().float()
-            strong_batch = batch_w_s['img_s'].cuda().float()
+        source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'], train_loader['u_loader'])
+        for i, (batch,
+                (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2),
+                (img_u_w_mix, img_u_s1_mix, img_u_s2_mix, ignore_mask_mix, _, _)) in enumerate(source_dataset):
             
-            sup_batch_len = img.shape[0]
-            unsup_batch_len = weak_batch.shape[0]
+            torch.cuda.empty_cache()
+            img_x, mask_x = batch['image'].cuda(), batch['label'].cuda()
+            img_u_w = img_u_w.cuda()
+            img_u_s1, img_u_s2, ignore_mask = img_u_s1.cuda(), img_u_s2.cuda(), ignore_mask.cuda()
+            cutmix_box1, cutmix_box2 = cutmix_box1.cuda(), cutmix_box2.cuda()
+            img_u_w_mix = img_u_w_mix.cuda()
+            img_u_s1_mix, img_u_s2_mix = img_u_s1_mix.cuda(), img_u_s2_mix.cuda()
+            ignore_mask_mix = ignore_mask_mix.cuda()
             
-            # chỉ lấy nhánh main để tính
-            output = model(img)
-            output = torch.sigmoid(output)
+            sup_batch_len = img_x.shape[0]
+            with torch.no_grad():
+                model.eval()
+
+                feat_u_w_mix = model(img_u_w_mix).detach()
+                pred_u_w_mix = torch.sigmoid(feat_u_w_mix)
+                conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
+                mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
+                _, H, W =conf_u_w_mix.shape
+                _, _, h, w = feat_u_w_mix.shape
+
+            img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = \
+                img_u_s1_mix[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
+            img_u_s2[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1] = \
+                img_u_s2_mix[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1]
             
-            # calculate loss
-            assert (output.shape == label.shape)
-            losses = []
+            model.train()
+
+            num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
+
+            feats, feats_fp = model(torch.cat((img_x, img_u_w)), True)
+            preds = torch.sigmoid(feats)
+            preds_fp = torch.sigmoid(feats_fp)
+            pred_x, pred_u_w = preds.split([num_lb, num_ulb])
+            _, feat_u_w = feats.split([num_lb, num_ulb])
+
+            pred_u_w_fp = preds_fp[num_lb:]
+
+            feats_u_s = model(torch.cat((img_u_s1, img_u_s2)))
+            preds_u_s = torch.sigmoid(feats_u_s)
+            pred_u_s1, pred_u_s2 = preds_u_s.chunk(2)
+            feat_u_s1, feat_u_s2 = feats_u_s.chunk(2)
+
+            pred_u_w = pred_u_w.detach()
+            feat_u_w = feat_u_w.detach()
+            conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
+            mask_u_w = pred_u_w.argmax(dim=1)
+
+            feat_u_w = F.interpolate(feat_u_w, size=(H, W), mode="bilinear", align_corners=True)
+            feat_u_w_mix = F.interpolate(feat_u_w_mix, size=(H, W), mode="bilinear", align_corners=True)
+
+            mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1, feat_u_w_cutmixed1 = \
+                mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone(), feat_u_w.clone()
+            mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2, feat_u_w_cutmixed2 = \
+                mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone(), feat_u_w.clone()
+            
+            mask_u_w_cutmixed1[cutmix_box1 == 1] = mask_u_w_mix[cutmix_box1 == 1]
+            conf_u_w_cutmixed1[cutmix_box1 == 1] = conf_u_w_mix[cutmix_box1 == 1]
+            ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask_mix[cutmix_box1 == 1]
+
+
+            cutmix_box1 = cutmix_box1.unsqueeze(1).expand(feat_u_w.shape)
+            feat_u_w_cutmixed1 = torch.where(cutmix_box1 == 1, feat_u_w_mix, feat_u_w_cutmixed1)
+            feat_u_w_cutmixed1 = F.interpolate(feat_u_w_cutmixed1, size=(h, w), mode="bilinear", align_corners=True)
+
+            mask_u_w_cutmixed2[cutmix_box2 == 1] = mask_u_w_mix[cutmix_box2 == 1]
+            conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w_mix[cutmix_box2 == 1]
+            ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask_mix[cutmix_box2 == 1]
+            cutmix_box2 = cutmix_box2.unsqueeze(1).expand(feat_u_w.shape)
+            feat_u_w_cutmixed2 = torch.where(cutmix_box2 == 1, feat_u_w_mix, feat_u_w_cutmixed2)
+            feat_u_w_cutmixed2 = F.interpolate(feat_u_w_cutmixed2, size=(h, w), mode="bilinear", align_corners=True)
+
+
+            losses_l = []
             for function in criterion[:2]:
-                losses.append(function(output, label))
-            
-            # RankMatch
-            #======================================================================================================
-            # outputs for model
-            feat_w = model(weak_batch)
-            feat_s = model(strong_batch)
+                losses_l.append(function(pred_x, mask_x))
+            loss_x = sum(losses_l) / 2
 
-            outputs_weak_soft = torch.sigmoid(feat_w)
-            outputs_strong_soft = torch.sigmoid(feat_s)
+            loss_u_s1_arr = []
+            for function in criterion[2:]:
+                loss_u_s1_arr.append(function(pred_u_s1, mask_u_w_cutmixed1))
+            loss_u_s1 = sum(loss_u_s1_arr) / 2
+            loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= config.semi.conf_thresh) & (ignore_mask_cutmixed1 != 255))
+            loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
-            # minmax normalization for softmax outputs before applying mask
-            pseudo_mask = (outputs_weak_soft > config.semi.conf_thresh).float()
-            outputs_weak_masked = outputs_weak_soft * pseudo_mask
-            pseudo_outputs = torch.round(outputs_weak_masked)
+            loss_u_s2_arr = []
+            for function in criterion[2:]:
+                loss_u_s2_arr.append(function(pred_u_s2, mask_u_w_cutmixed2))
+            loss_u_s2 = sum(loss_u_s2_arr) / 2
+            loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= config.semi.conf_thresh) & (ignore_mask_cutmixed2 != 255))
+            loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
 
-            # calculate loss
-            for function in criterion:
-                losses.append(function(outputs_strong_soft, pseudo_outputs))
-                if function == corr_loss:
-                    losses.append(function(feat_w, feat_s))            #======================================================================================================
-            consistency_weight = get_current_consistency_weight(iter // 150)
-            sup_loss = (losses[0] + losses[1]) / 2
-            unsup_loss = (losses[2] + 0.45 + losses[3]*0.45 + losses[4]*0.1)
-            loss = sup_loss + unsup_loss * (sup_batch_len / unsup_batch_len) * consistency_weight
-            
-            # Cộng dồn loss thành phần
-            bce_sup_loss_sum += losses[0].item() * sup_batch_len
-            dice_sup_loss_sum += losses[1].item() * sup_batch_len
-            bce_unsup_loss_sum += losses[2].item() * sup_batch_len
-            dice_unsup_loss_sum += losses[3].item() * sup_batch_len
-            corr_unsup_loss_sum += losses[4].item() * sup_batch_len
-            
+            loss_u_w_fp_arr = []
+            for function in criterion[2:]:
+                loss_u_w_fp_arr.append(function(pred_u_w_fp, mask_u_w))
+            loss_u_w_fp = sum(loss_u_w_fp_arr) / 2
+            loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= config.semi.conf_thresh) & (ignore_mask != 255))
+            loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
+
+
+            loss_c_arr = []
+            loss_c_s1 = criterion[-1](feat_u_w_cutmixed1, feat_u_s1)
+            loss_c_arr.append(loss_c_s1)
+            loss_c_s2 = criterion[-1](feat_u_w_cutmixed2, feat_u_s2)
+            loss_c_arr.append(loss_c_s2)
+
+            loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0 + 0.1 * (loss_c_s1 + loss_c_s2) / 2.0
+
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            
+            # Calculate and accumulate training loss
             loss_train_sum += loss.item() * sup_batch_len
             
-            # calculate metrics
+            # Accumulate component losses
+            bce_sup_loss_sum += losses_l[0].item() * sup_batch_len
+            dice_sup_loss_sum += losses_l[1].item() * sup_batch_len
+            bce_unsup_loss_sum += (loss_u_s1_arr[0].item() + loss_u_s2_arr[0].item() + loss_u_w_fp_arr[0].item()) * sup_batch_len
+            dice_unsup_loss_sum += (loss_u_s1_arr[1].item() + loss_u_s2_arr[1].item() + loss_u_w_fp_arr[1].item()) * sup_batch_len
+            corr_unsup_loss_sum += (loss_c_s1.item() + loss_c_s2.item()) * sup_batch_len
+
+
+            # Calculate evaluation metrics
             with torch.no_grad():
                 output = output.cpu().numpy() > 0.5
                 label = label.cpu().numpy()
-                assert (output.shape == label.shape)
+                assert (output.shape == label.shape), "Output and label shapes must match"
+                
+                # Calculate Dice and IoU metrics
                 dice_train = metrics.dc(output, label)
                 iou_train = metrics.jc(output, label)
                 dice_train_sum += dice_train * sup_batch_len
                 iou_train_sum += iou_train * sup_batch_len
-                 
-            file_log.write('Epoch {}, iter {}, Dice Sup Loss: {}, Dice Unsup Loss: {}, BCE Sup Loss: {}, BCE UnSup Loss: {}, Corr Unsup Loss: {}\n'.format(
-                epoch, iter + 1, round(losses[1].item(), 5), round(losses[3].item(), 5), round(losses[0].item(), 5), round(losses[2].item(), 5), round(losses[4].item(), 5)
-            ))
-            file_log.flush()
-            print('Epoch {}, iter {}, Dice Sup Loss: {}, Dice Unsup Loss: {}, BCE Sup Loss: {}, BCE UnSup Loss: {}, Corr Unsup Loss: {}'.format(
-                epoch, iter + 1, round(losses[1].item(), 5), round(losses[3].item(), 5), round(losses[0].item(), 5), round(losses[2].item(), 5), round(losses[4].item(), 5)
-            ))
+                
+                # Log training metrics
+                metrics_str = (
+                    f'Epoch {epoch}, iter {iter + 1}\n'
+                    f'Supervised Losses:\n'
+                    f'  - BCE Loss: {round(losses_l[0].item(), 5)}\n'
+                    f'  - Dice Loss: {round(losses_l[1].item(), 5)}\n'
+                    f'Unsupervised Losses (S1):\n'
+                    f'  - BCE Loss: {round(loss_u_s1_arr[0].item(), 5)}\n'
+                    f'  - Dice Loss: {round(loss_u_s1_arr[1].item(), 5)}\n'
+                    f'  - Correlation Loss: {round(loss_c_s1.item(), 5)}\n'
+                    f'Unsupervised Losses (S2):\n'
+                    f'  - BCE Loss: {round(loss_u_s2_arr[0].item(), 5)}\n'
+                    f'  - Dice Loss: {round(loss_u_s2_arr[1].item(), 5)}\n'
+                    f'  - Correlation Loss: {round(loss_c_s2.item(), 5)}\n'
+                    f'Unsupervised Feature Perturbation Losses:\n'
+                    f'  - BCE Loss: {round(loss_u_w_fp_arr[0].item(), 5)}\n'
+                    f'  - Dice Loss: {round(loss_u_w_fp_arr[1].item(), 5)}\n'
+                    f'Total Loss: {round(loss.item(), 5)}'
+                )
+                file_log.write(metrics_str + '\n')
+                file_log.flush()
+                print(metrics_str)
             
             num_train += sup_batch_len
             iter += 1
             
-            # end one test batch
-            if config.debug: break
-                
+            if config.debug:
+                break
 
-        # print
-        file_log.write('Epoch {}, Total train step {} || AVG_loss: {}, Avg Dice score: {}, Avg IOU: {}\n'.format(epoch, 
-                                                                                                      iter, 
-                                                                                                      round(loss_train_sum / num_train,5), 
-                                                                                                      round(dice_train_sum/num_train,4), 
-                                                                                                      round(iou_train_sum/num_train,4)))
+        # Calculate and log average training metrics
+        avg_metrics_str = (
+            f'Epoch {epoch}, Total train step {iter} || '
+            f'AVG_loss: {round(loss_train_sum / num_train, 5)}, '
+            f'Avg Dice score: {round(dice_train_sum/num_train, 4)}, '
+            f'Avg IOU: {round(iou_train_sum/num_train, 4)}'
+        )
+        file_log.write(avg_metrics_str + '\n')
         file_log.flush()
-        print('Epoch {}, Total train step {} || AVG_loss: {}, Avg Dice score: {}, Avg IOU: {}'.format(epoch, 
-                                                                                                      iter, 
-                                                                                                      round(loss_train_sum / num_train,5), 
-                                                                                                      round(dice_train_sum/num_train,4), 
-                                                                                                      round(iou_train_sum/num_train,4)))
+        print(avg_metrics_str)
             
-        # Tính trung bình loss thành phần
+        # Calculate average component losses
         avg_bce_sup_loss = bce_sup_loss_sum / num_train
         avg_dice_sup_loss = dice_sup_loss_sum / num_train
         avg_bce_unsup_loss = bce_unsup_loss_sum / num_train
@@ -241,124 +330,130 @@ def train_val(config, model, train_loader, val_loader, criterion):
         avg_corr_unsup_loss = corr_unsup_loss_sum / num_train
 
         # -----------------------------------------------------------------
-        # validate
-        # ----------------------------------------------------------------
+        # Validation phase
+        # -----------------------------------------------------------------
         model.eval()
         
-        dice_val_sum= 0
-        iou_val_sum = 0
-        loss_val_sum = 0
+        # Initialize validation metrics
+        val_metrics = {
+            'dice': 0, 'iou': 0, 'loss': 0, 'acc': 0,
+            'sen': 0, 'spe': 0, 'pre': 0
+        }
         num_val = 0
-        acc_val_sum = 0
-        sen_val_sum = 0
-        spe_val_sum = 0
-        pre_val_sum = 0
 
         for batch_id, batch in enumerate(val_loader):
             img = batch['image'].cuda().float()
             label = batch['label'].cuda().float()
-            
             batch_len = img.shape[0]
 
             with torch.no_grad():
+                # Forward pass
                 output = model(img)
-                    
                 output = torch.sigmoid(output)
 
-                # calculate loss
-                assert (output.shape == label.shape)
-                losses = []
-                for function in criterion:
-                    losses.append(function(output, label))
-                loss_val_sum += sum(losses)*batch_len / 2
+                # Calculate validation loss
+                assert (output.shape == label.shape), "Output and label shapes must match"
+                losses = [function(output, label) for function in criterion[:2]]
+                val_metrics['loss'] += sum(losses) * batch_len / 2
 
-                # calculate metrics
+                # Calculate validation metrics
                 output_np = output.cpu().numpy() > 0.5
                 label_np = label.cpu().numpy()
-                dice_val_sum += metrics.dc(output_np, label_np)*batch_len
-                iou_val_sum += metrics.jc(output_np, label_np)*batch_len
+                val_metrics['dice'] += metrics.dc(output_np, label_np) * batch_len
+                val_metrics['iou'] += metrics.jc(output_np, label_np) * batch_len
 
-                # Tính các metrics segmentation cho val (dùng tensor float)
+                # Calculate segmentation metrics
                 output_bin = (output > 0.5).float().cpu()
                 label_bin = label.float().cpu()
                 seg_metrics = segmentation_metrics(output_bin, label_bin)
-                acc_val_sum += seg_metrics['ACC'] * batch_len
-                sen_val_sum += seg_metrics['SEN'] * batch_len
-                spe_val_sum += seg_metrics['SPE'] * batch_len
-                pre_val_sum += seg_metrics['PRE'] * batch_len
+                
+                for metric in ['acc', 'sen', 'spe', 'pre']:
+                    val_metrics[metric] += seg_metrics[metric.upper()] * batch_len
 
                 num_val += batch_len
-                # end one val batch
-                if config.debug: break
+                
+                if config.debug:
+                    break
 
-        # logging per epoch for one dataset
-        loss_val_epoch, dice_val_epoch, iou_val_epoch = loss_val_sum/num_val, dice_val_sum/num_val, iou_val_sum/num_val
-        acc_val_epoch = acc_val_sum / num_val
-        sen_val_epoch = sen_val_sum / num_val
-        spe_val_epoch = spe_val_sum / num_val
-        pre_val_epoch = pre_val_sum / num_val
-        
-        file_log.write('Epoch {}, Validation || sum_loss: {}, Dice score: {}, IOU: {}\n'.
-                format(epoch, round(loss_val_epoch.item(),5), 
-                round(dice_val_epoch,4), round(iou_val_epoch,4)))
+        # Calculate average validation metrics
+        for metric in val_metrics:
+            val_metrics[metric] /= num_val
+
+        # Log validation results
+        val_str = (
+            f'Epoch {epoch}, Validation || '
+            f'sum_loss: {round(val_metrics["loss"].item(), 5)}, '
+            f'Dice score: {round(val_metrics["dice"], 4)}, '
+            f'IOU: {round(val_metrics["iou"], 4)}'
+        )
+        file_log.write(val_str + '\n')
         file_log.flush()
-        # print
-        print('Epoch {}, Validation || sum_loss: {}, Dice score: {}, IOU: {}'.
-                format(epoch, round(loss_val_epoch.item(),5), 
-                round(dice_val_epoch,4), round(iou_val_epoch,4)))
+        print(val_str)
 
-
-        # scheduler step, record lr
+        # Update learning rate
         scheduler.step()
 
-        # store model using the average iou
-        if dice_val_epoch > max_dice:
+        # Save best model
+        if val_metrics['dice'] > max_dice:
             torch.save(model.state_dict(), best_model_dir)
-            max_dice = dice_val_epoch
+            max_dice = val_metrics['dice']
             best_epoch = epoch
-            file_log.write('New best epoch {}!===============================\n'.format(epoch))
+            best_str = f'New best epoch {epoch}!==============================='
+            file_log.write(best_str + '\n')
             file_log.flush()
-            print('New best epoch {}!==============================='.format(epoch))
+            print(best_str)
         
+        # Log training time
         end = time.time()
-        time_elapsed = end-start
-        file_log.write('Training and evaluating on epoch{} complete in {:.0f}m {:.0f}s\n'.
-                    format(epoch, time_elapsed // 60, time_elapsed % 60))
+        time_elapsed = end - start
+        time_str = (
+            f'Training and evaluating on epoch{epoch} complete in '
+            f'{time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s'
+        )
+        file_log.write(time_str + '\n')
         file_log.flush()
-        print('Training and evaluating on epoch{} complete in {:.0f}m {:.0f}s'.
-                    format(epoch, time_elapsed // 60, time_elapsed % 60))
+        print(time_str)
 
-        # end one epoch
-        if config.debug: return
+        if config.debug:
+            return
 
+        # Log metrics to wandb
         wandb.log({
+            # Training metrics
             "train/loss": loss_train_sum / num_train,
             "train/dice": dice_train_sum / num_train,
             "train/iou": iou_train_sum / num_train,
+            
+            # Supervised losses
             "train/bce_sup_loss": avg_bce_sup_loss,
             "train/dice_sup_loss": avg_dice_sup_loss,
+            
+            # Unsupervised losses
             "train/bce_unsup_loss": avg_bce_unsup_loss,
             "train/dice_unsup_loss": avg_dice_unsup_loss,
             "train/corr_unsup_loss": avg_corr_unsup_loss,
-            "train/consistency_weight": consistency_weight,
-            "train/sup_loss": sup_loss.item(),
-            "train/unsup_loss": unsup_loss.item(),
-            "val/loss": loss_val_epoch.item(),
-            "val/dice": dice_val_epoch,
-            "val/iou": iou_val_epoch,
-            "val/acc": acc_val_epoch,
-            "val/sensitivity": sen_val_epoch,
-            "val/specificity": spe_val_epoch,
-            "val/precision": pre_val_epoch,
+            
+            # Validation metrics
+            "val/loss": val_metrics["loss"].item(),
+            "val/dice": val_metrics["dice"],
+            "val/iou": val_metrics["iou"],
+            "val/acc": val_metrics["acc"],
+            "val/sensitivity": val_metrics["sen"],
+            "val/specificity": val_metrics["spe"],
+            "val/precision": val_metrics["pre"],
+            
+            # Other metrics
             "epoch": epoch,
             "lr": scheduler.get_last_lr()[0]
         })
     
-    file_log.write('Complete training ---------------------------------------------------- \n The best epoch is {}\n'.format(best_epoch))
+    # Log training completion
+    completion_str = f'Complete training ---------------------------------------------------- \n The best epoch is {best_epoch}'
+    file_log.write(completion_str + '\n')
     file_log.flush()
-    print('Complete training ---------------------------------------------------- \n The best epoch is {}'.format(best_epoch))
+    print(completion_str)
 
-    # Lưu folder checkpoints lên wandb sử dụng Artifacts
+    # Save checkpoints to wandb
     checkpoint_dir = f"checkpoints/{config.data.name}/{args.exp}_{config.data.supervised_ratio}/fold{args.fold}"
     artifact = wandb.Artifact(
         name=f"{args.exp}_{config.data.supervised_ratio}_fold{args.fold}",
@@ -369,7 +464,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
     wandb.log_artifact(artifact)
     print(f"Saved checkpoints to wandb artifacts from {checkpoint_dir}")
 
-    return 
+    return
 
 
 
@@ -397,7 +492,7 @@ def test(config, model, model_dir, test_loader, criterion):
             # calculate loss
             assert (output.shape == label.shape)
             losses = []
-            for function in criterion:
+            for function in criterion[:2]:
                 losses.append(function(output, label))
             loss_test_sum += sum(losses)*batch_len
 

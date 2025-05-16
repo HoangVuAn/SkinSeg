@@ -33,6 +33,7 @@ torch.cuda.empty_cache()
 def main(config):
     
     wandb.init(project="SkinSeg", name=f"UniMatch_fold{config.fold}", config=config)
+    # wandb.init(mode="disabled")
     
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
@@ -249,6 +250,12 @@ def train_val(config, model, train_loader, val_loader, criterion):
             optimizer.step()
             loss_train_sum += loss.item() * sup_batch_len
             
+            # Accumulate component losses
+            bce_sup_loss_sum += losses[0].item() * sup_batch_len
+            dice_sup_loss_sum += losses[1].item() * sup_batch_len
+            bce_unsup_loss_sum += (losses_s1[0].item() + losses_s2[0].item() + losses_fp[0].item()) * sup_batch_len
+            dice_unsup_loss_sum += (losses_s1[1].item() + losses_s2[1].item() + losses_fp[1].item()) * sup_batch_len
+            
             # calculate metrics
             with torch.no_grad():
                 output = output.cpu().numpy() > 0.5
@@ -287,7 +294,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
                                                                                                       round(dice_train_sum/num_train,4), 
                                                                                                       round(iou_train_sum/num_train,4)))
             
-        # Tính trung bình loss thành phần
+        # Calculate average component losses
         avg_bce_sup_loss = bce_sup_loss_sum / num_train
         avg_dice_sup_loss = dice_sup_loss_sum / num_train
         avg_bce_unsup_loss = bce_unsup_loss_sum / num_train
