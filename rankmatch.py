@@ -246,9 +246,9 @@ def train_val(config, model, train_loader, val_loader, criterion):
 
 
             loss_c_arr = []
-            loss_c_s1 = criterion[-1](feat_u_w_cutmixed1, feat_u_s1)
+            loss_c_s1 = criterion[-1](feat_u_w_cutmixed1[None], feat_u_s1[None])
             loss_c_arr.append(loss_c_s1)
-            loss_c_s2 = criterion[-1](feat_u_w_cutmixed2, feat_u_s2)
+            loss_c_s2 = criterion[-1](feat_u_w_cutmixed2[None], feat_u_s2[None])
             loss_c_arr.append(loss_c_s2)
 
             loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0 + 0.1 * (loss_c_s1 + loss_c_s2) / 2.0
