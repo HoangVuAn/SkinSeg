@@ -116,7 +116,7 @@ def corr_loss(feat_w, feat_s):
         return rank, rank_s
 
 
-    criterion_c = torch.nn.KLDivLoss(reduction='mean') # pixel-reference correlation criterion
+    criterion_c = torch.nn.KLDivLoss(reduction='batchmean') # pixel-reference correlation criterion
 
     num_landmarks = 64
 

@@ -32,8 +32,8 @@ torch.cuda.empty_cache()
 
 def main(config):
     
-    wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
-    # wandb.init(mode="disabled")
+    # wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
+    wandb.init(mode="disabled")
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
                                                     train_aug=config.data.train_aug,
@@ -224,31 +224,31 @@ def train_val(config, model, train_loader, val_loader, criterion):
             loss_x = sum(losses_l) / 2
 
             loss_u_s1_arr = []
-            for function in criterion[2:]:
-                loss_u_s1_arr.append(function(pred_u_s1, mask_u_w_cutmixed1))
+            for function in criterion[:2]:
+                loss_u_s1_arr.append(function(pred_u_s1, mask_u_w_cutmixed1[:, None, :, :].to(torch.float32)))
             loss_u_s1 = sum(loss_u_s1_arr) / 2
             loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= config.semi.conf_thresh) & (ignore_mask_cutmixed1 != 255))
             loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
             loss_u_s2_arr = []
-            for function in criterion[2:]:
-                loss_u_s2_arr.append(function(pred_u_s2, mask_u_w_cutmixed2))
+            for function in criterion[:2]:
+                loss_u_s2_arr.append(function(pred_u_s2, mask_u_w_cutmixed2[:, None, :, :].to(torch.float32)))
             loss_u_s2 = sum(loss_u_s2_arr) / 2
             loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= config.semi.conf_thresh) & (ignore_mask_cutmixed2 != 255))
             loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
 
             loss_u_w_fp_arr = []
-            for function in criterion[2:]:
-                loss_u_w_fp_arr.append(function(pred_u_w_fp, mask_u_w))
+            for function in criterion[:2]:
+                loss_u_w_fp_arr.append(function(pred_u_w_fp, mask_u_w[:, None, :, :].to(torch.float32)))
             loss_u_w_fp = sum(loss_u_w_fp_arr) / 2
             loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= config.semi.conf_thresh) & (ignore_mask != 255))
             loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
 
 
             loss_c_arr = []
-            loss_c_s1 = criterion[-1](feat_u_w_cutmixed1[None], feat_u_s1[None])
+            loss_c_s1 = criterion[-1](feat_u_w_cutmixed1, feat_u_s1)
             loss_c_arr.append(loss_c_s1)
-            loss_c_s2 = criterion[-1](feat_u_w_cutmixed2[None], feat_u_s2[None])
+            loss_c_s2 = criterion[-1](feat_u_w_cutmixed2, feat_u_s2)
             loss_c_arr.append(loss_c_s2)
 
             loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0 + 0.1 * (loss_c_s1 + loss_c_s2) / 2.0
@@ -272,13 +272,13 @@ def train_val(config, model, train_loader, val_loader, criterion):
 
             # Calculate evaluation metrics
             with torch.no_grad():
-                output = output.cpu().numpy() > 0.5
-                label = label.cpu().numpy()
-                assert (output.shape == label.shape), "Output and label shapes must match"
+                pred_x = pred_x.cpu().numpy() > 0.5
+                mask_x = mask_x.cpu().numpy()
+                assert (pred_x.shape == mask_x.shape), "Output and label shapes must match"
                 
                 # Calculate Dice and IoU metrics
-                dice_train = metrics.dc(output, label)
-                iou_train = metrics.jc(output, label)
+                dice_train = metrics.dc(pred_x, mask_x)
+                iou_train = metrics.jc(pred_x, mask_x)
                 dice_train_sum += dice_train * sup_batch_len
                 iou_train_sum += iou_train * sup_batch_len
                 
