@@ -32,8 +32,8 @@ torch.cuda.empty_cache()
 
 def main(config):
     
-    wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
-    # wandb.init(mode="disabled")
+    # wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
+    wandb.init(mode="disabled")
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
                                                     train_aug=config.data.train_aug,
@@ -156,6 +156,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
             ignore_mask_mix = ignore_mask_mix.cuda()
             
             sup_batch_len = img_x.shape[0]
+            unsup_batch_len = img_u_w.shape[0]
             with torch.no_grad():
                 model.eval()
 
@@ -225,7 +226,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
 
             loss_u_s1_arr = []
             for function in criterion[:2]:
-                loss_u_s1_arr.append(function(pred_u_s1, mask_u_w_cutmixed1[:, None, :, :].to(torch.float32)))
+                loss_u_s1_arr.append(function(pred_u_s1, pred_u_w.to(torch.float32)))
             loss_u_s1 = sum(loss_u_s1_arr) / 2
             loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= config.semi.conf_thresh) & (ignore_mask_cutmixed1 != 255))
             loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
@@ -251,7 +252,8 @@ def train_val(config, model, train_loader, val_loader, criterion):
             loss_c_s2 = criterion[-1](feat_u_w_cutmixed2, feat_u_s2)
             loss_c_arr.append(loss_c_s2)
 
-            loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0 + 0.1 * (loss_c_s1 + loss_c_s2) / 2.0
+            consistency_weight = get_current_consistency_weight(iter // 150)
+            loss = loss_x + ((loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) + 0.1 * (loss_c_s1 + loss_c_s2) / 2.0) * (sup_batch_len / unsup_batch_len) * consistency_weight
 
 
             optimizer.zero_grad()
@@ -284,24 +286,24 @@ def train_val(config, model, train_loader, val_loader, criterion):
                 
                 # Log training metrics
                 metrics_str = (
-                    f'Epoch {epoch}, iter {iter + 1}\n'
-                    f'Supervised Losses:\n'
-                    f'  - BCE Loss: {round(losses_l[0].item(), 5)}\n'
-                    f'  - Dice Loss: {round(losses_l[1].item(), 5)}\n'
-                    f'Unsupervised Losses (S1):\n'
-                    f'  - BCE Loss: {round(loss_u_s1_arr[0].item(), 5)}\n'
-                    f'  - Dice Loss: {round(loss_u_s1_arr[1].item(), 5)}\n'
-                    f'  - Correlation Loss: {round(loss_c_s1.item(), 5)}\n'
-                    f'Unsupervised Losses (S2):\n'
-                    f'  - BCE Loss: {round(loss_u_s2_arr[0].item(), 5)}\n'
-                    f'  - Dice Loss: {round(loss_u_s2_arr[1].item(), 5)}\n'
-                    f'  - Correlation Loss: {round(loss_c_s2.item(), 5)}\n'
-                    f'Unsupervised Feature Perturbation Losses:\n'
-                    f'  - BCE Loss: {round(loss_u_w_fp_arr[0].item(), 5)}\n'
-                    f'  - Dice Loss: {round(loss_u_w_fp_arr[1].item(), 5)}\n'
+                    f'Epoch {epoch}, iter {iter + 1}-'
+                    f'Supervised Losses:-'
+                    f'  - BCE Loss: {round(losses_l[0].item(), 5)}-'
+                    f'  - Dice Loss: {round(losses_l[1].item(), 5)}-'
+                    f'Unsupervised Losses (S1):-'
+                    f'  - BCE Loss: {round(loss_u_s1_arr[0].item(), 5)}-'
+                    f'  - Dice Loss: {round(loss_u_s1_arr[1].item(), 5)}-'
+                    f'  - Correlation Loss: {round(loss_c_s1.item(), 5)}-'
+                    f'Unsupervised Losses (S2):-'
+                    f'  - BCE Loss: {round(loss_u_s2_arr[0].item(), 5)}-'
+                    f'  - Dice Loss: {round(loss_u_s2_arr[1].item(), 5)}-'
+                    f'  - Correlation Loss: {round(loss_c_s2.item(), 5)}-'
+                    f'Unsupervised Feature Perturbation Losses:-'
+                    f'  - BCE Loss: {round(loss_u_w_fp_arr[0].item(), 5)}-'
+                    f'  - Dice Loss: {round(loss_u_w_fp_arr[1].item(), 5)}-'
                     f'Total Loss: {round(loss.item(), 5)}'
                 )
-                file_log.write(metrics_str + '\n')
+                file_log.write(metrics_str + '-')
                 file_log.flush()
                 print(metrics_str)
             
@@ -463,7 +465,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
     artifact.add_dir(checkpoint_dir)
     wandb.log_artifact(artifact)
     print(f"Saved checkpoints to wandb artifacts from {checkpoint_dir}")
-
+    wandb.finish()
     return
 
 
