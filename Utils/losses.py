@@ -118,7 +118,7 @@ def corr_loss(feat_w, feat_s):
 
     criterion_c = torch.nn.KLDivLoss(reduction='batchmean') # pixel-reference correlation criterion
 
-    num_landmarks = 64
+    num_landmarks = 8
 
     refers_w, refers_s = orthogonal_landmarks(feat_w, feat_s, num_landmarks)
 

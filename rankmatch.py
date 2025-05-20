@@ -253,7 +253,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
             loss_c_arr.append(loss_c_s2)
 
             consistency_weight = get_current_consistency_weight(iter // 150)
-            loss = loss_x + ((loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) + 0.1 * (loss_c_s1 + loss_c_s2) / 2.0) * (sup_batch_len / unsup_batch_len) * consistency_weight
+            loss = loss_x + ((loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) + 0.01 * (loss_c_s1 + loss_c_s2) / 2.0) * (sup_batch_len / unsup_batch_len) * consistency_weight
 
 
             optimizer.zero_grad()
