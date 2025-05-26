@@ -434,8 +434,8 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
                 # Calculate metrics
                 pred_np = (pred > 0.5).cpu().numpy()
                 mask_np = mask_x.cpu().numpy()
-                metrics = segmentation_metrics(pred_np, mask_np)
-                for k, v in metrics.items():
+                metric = segmentation_metrics(pred_np, mask_np)
+                for k, v in metric.items():
                     val_metrics[k].append(v * batch_len)
                 
                 num_val += batch_len
