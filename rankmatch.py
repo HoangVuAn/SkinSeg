@@ -2,6 +2,7 @@
 The default exp_name is tmp. Change it before formal training! isic2018 PH2 DMF SKD
 nohup python -u multi_train_adapt.py --exp_name test --config_yml Configs/multi_train_local.yml --model MedFormer --batch_size 16 --adapt_method False --num_domains 1 --dataset PH2  --k_fold 4 > 4MedFormer_PH2.out 2>&1 &
 '''
+import numpy as np
 import argparse
 from sqlite3 import adapt
 import yaml
@@ -30,10 +31,56 @@ from itertools import cycle
 
 torch.cuda.empty_cache()
 
+def save_checkpoint(model, optimizer, scheduler, epoch, best_metrics, config, args, is_best=False):
+    """Save checkpoint to disk and wandb"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_metrics': best_metrics,
+        'config': config,
+        'args': args
+    }
+    
+    # Save latest checkpoint
+    checkpoint_dir = f"checkpoints/{config.data.name}/{args.exp}_{config.data.supervised_ratio}/fold{args.fold}"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    latest_path = f"{checkpoint_dir}/latest.pth"
+    torch.save(checkpoint, latest_path)
+    
+    # Save best checkpoint if needed
+    if is_best:
+        best_path = f"{checkpoint_dir}/best.pth"
+        torch.save(checkpoint, best_path)
+    
+    # Save to wandb
+    artifact = wandb.Artifact(
+        name=f"{args.exp}_{config.data.supervised_ratio}_fold{args.fold}_latest",
+        type="model",
+        description=f"Latest checkpoint for {args.exp} with {config.data.supervised_ratio} supervised ratio, fold {args.fold}"
+    )
+    artifact.add_file(latest_path)
+    wandb.log_artifact(artifact)
+
+def load_checkpoint_from_wandb(model, optimizer, scheduler, artifact_name, device='cuda'):
+    """Load checkpoint from wandb"""
+    api = wandb.Api()
+    artifact = api.artifact(artifact_name)
+    artifact_dir = artifact.download()
+    
+    checkpoint = torch.load(f"{artifact_dir}/latest.pth", map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    return checkpoint['epoch'], checkpoint['best_metrics']
+
 def main(config):
     
-    wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
-    # wandb.init(mode="disabled")
+    # wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
+    wandb.init(mode="disabled")
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
                                                     train_aug=config.data.train_aug,
@@ -68,11 +115,7 @@ def main(config):
     train_loader = {'l_loader':l_train_loader, 'u_loader':u_train_loader}
     print(len(u_train_loader), len(l_train_loader))
 
-    
-    model  = SwinUnet(img_size=config.data.img_size)
-
-
-
+    model = SwinUnet(img_size=config.data.img_size)
 
     total_trainable_params = sum(
                     p.numel() for p in model.parameters() if p.requires_grad)
@@ -80,16 +123,51 @@ def main(config):
     print('{}M total parameters'.format(total_params/1e6))
     print('{}M total trainable parameters'.format(total_trainable_params/1e6))
     
-
     model = model.cuda()
-    
     criterion = [nn.BCELoss(), dice_loss, corr_loss]
+
+    # Initialize optimizer and scheduler
+    if config.train.optimizer.mode == 'adam':
+        print('choose wrong optimizer')
+    elif config.train.optimizer.mode == 'adamw':
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                              lr=float(config.train.optimizer.adamw.lr),
+                              weight_decay=float(config.train.optimizer.adamw.weight_decay))
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+
+    # Initialize training state
+    start_epoch = 0
+    best_metrics = {
+        'val_dice': 0.0,
+        'val_iou': 0.0,
+        'val_acc': 0.0,
+        'val_sen': 0.0,
+        'val_spe': 0.0
+    }
+
+    # Resume from checkpoint if specified
+    if args.resume is not None:
+        print(f"Resuming from checkpoint: {args.resume}")
+        if args.resume.startswith('wandb://'):
+            # Load from wandb
+            artifact_name = args.resume.replace('wandb://', '')
+            print(f"Loading checkpoint from wandb artifact: {artifact_name}")
+            start_epoch, best_metrics = load_checkpoint_from_wandb(model, optimizer, scheduler, artifact_name)
+        else:
+            # Load from local file
+            checkpoint = torch.load(args.resume, map_location='cuda')
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_metrics = checkpoint['best_metrics']
+        print(f"Resumed from epoch {start_epoch-1}")
 
     # only test
     if config.test.only_test == True:
         test(config, model, config.test.test_model_dir, test_loader, criterion)
     else:
-        train_val(config, model, train_loader, val_loader, criterion)
+        train_val(config, model, train_loader, val_loader, criterion, optimizer, scheduler, start_epoch, best_metrics, args)
         test(config, model, best_model_dir, test_loader, criterion)
 
 def sigmoid_rampup(current, rampup_length):
@@ -105,27 +183,20 @@ def get_current_consistency_weight(epoch):
     return args.consistency * sigmoid_rampup(epoch, args.consistency_rampup)
 
 # =======================================================================================================
-def train_val(config, model, train_loader, val_loader, criterion):
-    # optimizer loss
-    if config.train.optimizer.mode == 'adam':
-        # optimizer = optim.Adam(model.parameters(), lr=float(config.train.optimizer.adam.lr))
-        print('choose wrong optimizer')
-    elif config.train.optimizer.mode == 'adamw':
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),lr=float(config.train.optimizer.adamw.lr),
-                                weight_decay=float(config.train.optimizer.adamw.weight_decay))
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-
+def train_val(config, model, train_loader, val_loader, criterion, optimizer, scheduler, start_epoch, best_metrics, args):
     # ---------------------------------------------------------------------------
     # Training and Validating
     #----------------------------------------------------------------------------
     epochs = config.train.num_epochs
     max_iou = 0 # use for record best model
     max_dice = 0 # use for record best model
-    best_epoch = 0 # use for recording the best epoch
-    # create training data loading iteration
+    best_epoch = start_epoch # use for recording the best epoch
     
-    torch.save(model.state_dict(), best_model_dir)
-    for epoch in range(epochs):
+    # Save initial checkpoint if starting from beginning
+    if start_epoch == 0:
+        save_checkpoint(model, optimizer, scheduler, 0, best_metrics, config, args)
+    
+    for epoch in range(start_epoch, epochs):
         start = time.time()
         # ----------------------------------------------------------------------
         # train
@@ -338,117 +409,98 @@ def train_val(config, model, train_loader, val_loader, criterion):
         
         # Initialize validation metrics
         val_metrics = {
-            'dice': 0, 'iou': 0, 'loss': 0, 'acc': 0,
-            'sen': 0, 'spe': 0, 'pre': 0
+            'dice': [],
+            'iou': [],
+            'acc': [],
+            'sen': [],
+            'spe': [],
+            'loss': []
         }
         num_val = 0
-
-        for batch_id, batch in enumerate(val_loader):
-            img = batch['image'].cuda().float()
-            label = batch['label'].cuda().float()
-            batch_len = img.shape[0]
-
-            with torch.no_grad():
-                # Forward pass
-                output = model(img)
-                output = torch.sigmoid(output)
-
-                # Calculate validation loss
-                assert (output.shape == label.shape), "Output and label shapes must match"
-                losses = [function(output, label) for function in criterion[:2]]
-                val_metrics['loss'] += sum(losses) * batch_len / 2
-
-                # Calculate validation metrics
-                output_np = output.cpu().numpy() > 0.5
-                label_np = label.cpu().numpy()
-                val_metrics['dice'] += metrics.dc(output_np, label_np) * batch_len
-                val_metrics['iou'] += metrics.jc(output_np, label_np) * batch_len
-
-                # Calculate segmentation metrics
-                output_bin = (output > 0.5).float().cpu()
-                label_bin = label.float().cpu()
-                seg_metrics = segmentation_metrics(output_bin, label_bin)
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                img_x, mask_x = batch['image'].cuda(), batch['label'].cuda()
+                batch_len = img_x.shape[0]
                 
-                for metric in ['acc', 'sen', 'spe', 'pre']:
-                    val_metrics[metric] += seg_metrics[metric.upper()] * batch_len
-
+                # Forward pass
+                pred = model(img_x)
+                pred = torch.sigmoid(pred)
+                
+                # Calculate loss
+                loss = criterion[0](pred, mask_x) + criterion[1](pred, mask_x)
+                val_metrics['loss'].append(loss.item() * batch_len)
+                
+                # Calculate metrics
+                pred_np = (pred > 0.5).cpu().numpy()
+                mask_np = mask_x.cpu().numpy()
+                metrics = segmentation_metrics(pred_np, mask_np)
+                for k, v in metrics.items():
+                    val_metrics[k].append(v * batch_len)
+                
                 num_val += batch_len
                 
                 if config.debug:
                     break
-
+        
         # Calculate average validation metrics
-        for metric in val_metrics:
-            val_metrics[metric] /= num_val
-
-        # Log validation results
-        val_str = (
-            f'Epoch {epoch}, Validation || '
-            f'sum_loss: {round(val_metrics["loss"].item(), 5)}, '
-            f'Dice score: {round(val_metrics["dice"], 4)}, '
-            f'IOU: {round(val_metrics["iou"], 4)}'
-        )
-        file_log.write(val_str + '\n')
-        file_log.flush()
-        print(val_str)
-
+        avg_metrics = {k: np.sum(v) / num_val for k, v in val_metrics.items()}
+        
+        # Check if current model is best
+        is_best = avg_metrics['dice'] > best_metrics['val_dice']
+        if is_best:
+            best_metrics = {
+                'val_dice': avg_metrics['dice'],
+                'val_iou': avg_metrics['iou'],
+                'val_acc': avg_metrics['acc'],
+                'val_sen': avg_metrics['sen'],
+                'val_spe': avg_metrics['spe']
+            }
+            max_dice = avg_metrics['dice']
+            max_iou = avg_metrics['iou']
+            best_epoch = epoch
+        
+        # Save checkpoint
+        save_checkpoint(model, optimizer, scheduler, epoch, best_metrics, config, args, is_best)
+        
         # Update learning rate
         scheduler.step()
-
-        # Save best model
-        if val_metrics['dice'] > max_dice:
-            torch.save(model.state_dict(), best_model_dir)
-            max_dice = val_metrics['dice']
-            best_epoch = epoch
-            best_str = f'New best epoch {epoch}!==============================='
-            file_log.write(best_str + '\n')
-            file_log.flush()
-            print(best_str)
         
-        # Log training time
-        end = time.time()
-        time_elapsed = end - start
-        time_str = (
-            f'Training and evaluating on epoch{epoch} complete in '
-            f'{time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s'
-        )
-        file_log.write(time_str + '\n')
-        file_log.flush()
-        print(time_str)
-
-        if config.debug:
-            return
-
-        # Log metrics to wandb
+        # Print progress
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Train Loss: {loss_train_sum/num_train:.4f}")
+        print(f"Val Metrics: {avg_metrics}")
+        print(f"Best Metrics: {best_metrics}")
+        print(f"Best Epoch: {best_epoch}")
+        print("-" * 50)
+        
+        # Log to wandb
         wandb.log({
             # Training metrics
-            "train/loss": loss_train_sum / num_train,
-            "train/dice": dice_train_sum / num_train,
-            "train/iou": iou_train_sum / num_train,
+            "train/total_loss": loss_train_sum/num_train,
+            "train/dice": dice_train_sum/num_train,
+            "train/iou": iou_train_sum/num_train,
             
-            # Supervised losses
-            "train/bce_sup_loss": avg_bce_sup_loss,
-            "train/dice_sup_loss": avg_dice_sup_loss,
-            
-            # Unsupervised losses
-            "train/bce_unsup_loss": avg_bce_unsup_loss,
-            "train/dice_unsup_loss": avg_dice_unsup_loss,
-            "train/corr_unsup_loss": avg_corr_unsup_loss,
+            # Component losses
+            "train/supervised/bce_loss": avg_bce_sup_loss,
+            "train/supervised/dice_loss": avg_dice_sup_loss,
+            "train/unsupervised/bce_loss": avg_bce_unsup_loss,
+            "train/unsupervised/dice_loss": avg_dice_unsup_loss,
+            "train/unsupervised/corr_loss": avg_corr_unsup_loss,
             
             # Validation metrics
-            "val/loss": val_metrics["loss"].item(),
-            "val/dice": val_metrics["dice"],
-            "val/iou": val_metrics["iou"],
-            "val/acc": val_metrics["acc"],
-            "val/sensitivity": val_metrics["sen"],
-            "val/specificity": val_metrics["spe"],
-            "val/precision": val_metrics["pre"],
+            "val/loss": avg_metrics["loss"],
+            "val/dice": avg_metrics["dice"],
+            "val/iou": avg_metrics["iou"],
+            "val/acc": avg_metrics["acc"],
+            "val/sensitivity": avg_metrics["sen"],
+            "val/specificity": avg_metrics["spe"],
             
             # Other metrics
-            "epoch": epoch,
-            "lr": scheduler.get_last_lr()[0]
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "epoch": epoch
         })
-    
+
     # Log training completion
     completion_str = f'Complete training ---------------------------------------------------- \n The best epoch is {best_epoch}'
     file_log.write(completion_str + '\n')
@@ -473,7 +525,13 @@ def train_val(config, model, train_loader, val_loader, criterion):
 
 # ========================================================================================================
 def test(config, model, model_dir, test_loader, criterion):
-    model.load_state_dict(torch.load(model_dir))
+    # Load checkpoint
+    checkpoint = torch.load(model_dir, map_location='cuda')
+    if isinstance(checkpoint, dict):
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
     model.eval()
     dice_test_sum= 0
     iou_test_sum = 0
@@ -486,9 +544,7 @@ def test(config, model, model_dir, test_loader, criterion):
         batch_len = img.shape[0]
             
         with torch.no_grad():
-                
             output = model(img)
-
             output = torch.sigmoid(output)
 
             # calculate loss
@@ -510,7 +566,6 @@ def test(config, model, model_dir, test_loader, criterion):
 
     # logging results for one dataset
     loss_test_epoch, dice_test_epoch, iou_test_epoch = loss_test_sum/num_test, dice_test_sum/num_test, iou_test_sum/num_test
-
 
     # logging average and store results
     with open(test_results_dir, 'w') as f:
@@ -555,6 +610,7 @@ if __name__=='__main__':
                     default=0.1, help='consistency')
     parser.add_argument('--consistency_rampup', type=float,
                     default=200.0, help='consistency_rampup')
+    parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
     config = yaml.load(open(args.config_yml), Loader=yaml.FullLoader)
     config['model_adapt']['adapt_method']=args.adapt_method
