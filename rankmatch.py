@@ -193,8 +193,8 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
     best_epoch = start_epoch # use for recording the best epoch
     
     # Save initial checkpoint if starting from beginning
-    if start_epoch == 0:
-        save_checkpoint(model, optimizer, scheduler, 0, best_metrics, config, args)
+    # if start_epoch == 0:
+    #     save_checkpoint(model, optimizer, scheduler, 0, best_metrics, config, args)
     
     for epoch in range(start_epoch, epochs):
         start = time.time()
@@ -432,8 +432,8 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
                 val_metrics['loss'].append(loss.item() * batch_len)
                 
                 # Calculate metrics
-                pred_np = (pred > 0.5).cpu().numpy()
-                mask_np = mask_x.cpu().numpy()
+                pred_np = (pred > 0.5).float().cpu()
+                mask_np = mask_x.float().cpu()
                 metric = segmentation_metrics(pred_np, mask_np)
                 for k, v in metric.items():
                     val_metrics[k].append(v * batch_len)
