@@ -409,12 +409,13 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
         
         # Initialize validation metrics
         val_metrics = {
+            'loss': [],
             'dice': [],
             'iou': [],
             'acc': [],
             'sen': [],
             'spe': [],
-            'loss': []
+            'pre': []
         }
         num_val = 0
         
@@ -432,11 +433,21 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
                 val_metrics['loss'].append(loss.item() * batch_len)
                 
                 # Calculate metrics
-                pred_np = (pred > 0.5).float().cpu()
-                mask_np = mask_x.float().cpu()
+                pred_np = pred.cpu()
+                mask_np = mask_x.cpu()
                 metric = segmentation_metrics(pred_np, mask_np)
-                for k, v in metric.items():
-                    val_metrics[k].append(v * batch_len)
+                
+                # Map metrics to our format
+                val_metrics['sen'].append(metric['SEN'] * batch_len)
+                val_metrics['spe'].append(metric['SPE'] * batch_len)
+                val_metrics['pre'].append(metric['PRE'] * batch_len)
+                val_metrics['acc'].append(metric['ACC'] * batch_len)
+                
+                # Calculate Dice and IoU using medpy metrics
+                output_np = pred.cpu().numpy() > 0.5
+                label_np = mask_x.cpu().numpy()
+                val_metrics['dice'].append(metrics.dc(output_np, label_np) * batch_len)
+                val_metrics['iou'].append(metrics.jc(output_np, label_np) * batch_len)
                 
                 num_val += batch_len
                 
@@ -454,7 +465,8 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
                 'val_iou': avg_metrics['iou'],
                 'val_acc': avg_metrics['acc'],
                 'val_sen': avg_metrics['sen'],
-                'val_spe': avg_metrics['spe']
+                'val_spe': avg_metrics['spe'],
+                'val_pre': avg_metrics['pre']
             }
             max_dice = avg_metrics['dice']
             max_iou = avg_metrics['iou']
@@ -495,6 +507,7 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
             "val/acc": avg_metrics["acc"],
             "val/sensitivity": avg_metrics["sen"],
             "val/specificity": avg_metrics["spe"],
+            "val/precision": avg_metrics["pre"],
             
             # Other metrics
             "learning_rate": optimizer.param_groups[0]['lr'],
