@@ -39,8 +39,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, best_metrics, config, ar
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'best_metrics': best_metrics,
-        'config': config,
-        'args': args
     }
     
     # Save latest checkpoint
@@ -69,18 +67,27 @@ def load_checkpoint_from_wandb(model, optimizer, scheduler, artifact_name, devic
     artifact = api.artifact(artifact_name)
     artifact_dir = artifact.download()
     
-    checkpoint = torch.load(f"{artifact_dir}/latest.pth", map_location=device)
+    checkpoint = torch.load(f"{artifact_dir}/latest.pth", map_location=device, weights_only=False)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
-    return checkpoint['epoch'], checkpoint['best_metrics']
+    return checkpoint['epoch']+1, checkpoint['best_metrics']
 
 def main(config):
-    
-    wandb.init(project="SkinSeg", name=f"RankMatch_fold{config.fold}", config=config)
-    # wandb.init(mode="disabled")
+    if args.wandb_id is not None:
+        wandb.init(
+            project="SkinSeg", 
+            name=f"RankMatch_fold{config.fold}", 
+            resume="allow",  # Allow resuming previous runs
+            id=args.wandb_id # Generate new run ID if not resuming
+        )
+    else:
+        wandb.init(
+            project="SkinSeg", 
+            name=f"RankMatch_fold{config.fold}", 
+        )
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
                                                     train_aug=config.data.train_aug,
@@ -148,20 +155,10 @@ def main(config):
     # Resume from checkpoint if specified
     if args.resume is not None:
         print(f"Resuming from checkpoint: {args.resume}")
-        if args.resume.startswith('wandb://'):
-            # Load from wandb
-            artifact_name = args.resume.replace('wandb://', '')
-            print(f"Loading checkpoint from wandb artifact: {artifact_name}")
-            start_epoch, best_metrics = load_checkpoint_from_wandb(model, optimizer, scheduler, artifact_name)
-        else:
-            # Load from local file
-            checkpoint = torch.load(args.resume, map_location='cuda')
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_metrics = checkpoint['best_metrics']
-        print(f"Resumed from epoch {start_epoch-1}")
+        artifact_name = args.resume
+        print(f"Loading checkpoint from wandb artifact: {artifact_name}")
+        start_epoch, best_metrics = load_checkpoint_from_wandb(model, optimizer, scheduler, artifact_name)
+        print(f"Resumed from epoch {start_epoch}")
 
     # only test
     if config.test.only_test == True:
@@ -489,16 +486,16 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
         # Log to wandb
         wandb.log({
             # Training metrics
-            "train/total_loss": loss_train_sum/num_train,
+            "train/loss": loss_train_sum/num_train,
             "train/dice": dice_train_sum/num_train,
             "train/iou": iou_train_sum/num_train,
             
             # Component losses
-            "train/supervised/bce_loss": avg_bce_sup_loss,
-            "train/supervised/dice_loss": avg_dice_sup_loss,
-            "train/unsupervised/bce_loss": avg_bce_unsup_loss,
-            "train/unsupervised/dice_loss": avg_dice_unsup_loss,
-            "train/unsupervised/corr_loss": avg_corr_unsup_loss,
+            "train/bce_sup_loss": avg_bce_sup_loss,
+            "train/dice_sup_loss": avg_dice_sup_loss,
+            "train/bce_unsup_loss": avg_bce_unsup_loss,
+            "train/dice_unsup_loss": avg_dice_unsup_loss,
+            "train/corr_unsup_loss": avg_corr_unsup_loss,
             
             # Validation metrics
             "val/loss": avg_metrics["loss"],
@@ -510,7 +507,7 @@ def train_val(config, model, train_loader, val_loader, criterion, optimizer, sch
             "val/precision": avg_metrics["pre"],
             
             # Other metrics
-            "learning_rate": optimizer.param_groups[0]['lr'],
+            "lr": optimizer.param_groups[0]['lr'],
             "epoch": epoch
         })
 
@@ -624,6 +621,7 @@ if __name__=='__main__':
     parser.add_argument('--consistency_rampup', type=float,
                     default=200.0, help='consistency_rampup')
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--wandb_id', type=str, default=None)
     args = parser.parse_args()
     config = yaml.load(open(args.config_yml), Loader=yaml.FullLoader)
     config['model_adapt']['adapt_method']=args.adapt_method
@@ -631,6 +629,7 @@ if __name__=='__main__':
     config['data']['k_fold'] = args.k_fold
     config['seed'] = args.seed
     config['fold'] = args.fold
+    config['wandb_id'] = args.wandb_id
     
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = True
