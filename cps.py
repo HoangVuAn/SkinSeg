@@ -259,13 +259,13 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
             ))
             file_log.flush()
             
-            print('Epoch {}, iter {}:'.format(epoch, iter + 1))
-            print('Dice Sup Loss 1: {}, Dice Unsup Loss 1: {}, BCE Sup Loss 1: {}, BCE UnSup Loss 1: {}'.format(
-                round(losses_l1[1].item(), 5), round(losses_u1[1].item(), 5), round(losses_l1[0].item(), 5), round(losses_u1[0].item(), 5)
-            ))
-            print('Dice Sup Loss 2: {}, Dice Unsup Loss 2: {}, BCE Sup Loss 2: {}, BCE UnSup Loss 2: {}'.format(
-                round(losses_l2[1].item(), 5), round(losses_u2[1].item(), 5), round(losses_l2[0].item(), 5), round(losses_u2[0].item(), 5)
-            ))
+            # print('Epoch {}, iter {}:'.format(epoch, iter + 1))
+            # print('Dice Sup Loss 1: {}, Dice Unsup Loss 1: {}, BCE Sup Loss 1: {}, BCE UnSup Loss 1: {}'.format(
+            #     round(losses_l1[1].item(), 5), round(losses_u1[1].item(), 5), round(losses_l1[0].item(), 5), round(losses_u1[0].item(), 5)
+            # ))
+            # print('Dice Sup Loss 2: {}, Dice Unsup Loss 2: {}, BCE Sup Loss 2: {}, BCE UnSup Loss 2: {}'.format(
+            #     round(losses_l2[1].item(), 5), round(losses_u2[1].item(), 5), round(losses_l2[0].item(), 5), round(losses_u2[0].item(), 5)
+            # ))
             
             num_train += sup_batch_len
             iter += 1
