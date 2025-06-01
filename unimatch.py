@@ -266,13 +266,13 @@ def train_val(config, model, train_loader, val_loader, criterion):
                 dice_train_sum += dice_train * sup_batch_len
                 iou_train_sum += iou_train * sup_batch_len
             
-            file_log.write('Epoch {}, iter {}, Sup Loss: {}, Unsup Loss: {}\n'.format(
-                epoch, iter + 1, round(sup_loss.item(), 5), round(unsup_loss.item(), 5)
-            ))
-            file_log.flush()
-            print('Epoch {}, iter {}, Sup Loss: {}, Unsup Loss: {}'.format(
-                epoch, iter + 1, round(sup_loss.item(), 5), round(unsup_loss.item(), 5)
-            ))
+            # file_log.write('Epoch {}, iter {}, Sup Loss: {}, Unsup Loss: {}\n'.format(
+            #     epoch, iter + 1, round(sup_loss.item(), 5), round(unsup_loss.item(), 5)
+            # ))
+            # file_log.flush()
+            # print('Epoch {}, iter {}, Sup Loss: {}, Unsup Loss: {}'.format(
+            #     epoch, iter + 1, round(sup_loss.item(), 5), round(unsup_loss.item(), 5)
+            # ))
             
             num_train += sup_batch_len
             iter += 1
