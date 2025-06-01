@@ -32,8 +32,8 @@ torch.cuda.empty_cache()
 
 def main(config):
     
-    wandb.init(project="SkinSeg", name=f"UniMatch_fold{config.fold}", config=config)
-    # wandb.init(mode="disabled")
+    # wandb.init(project="SkinSeg", name=f"UniMatch_fold{config.fold}", config=config)
+    wandb.init(mode="disabled")
     
     dataset = get_dataset(config, img_size=config.data.img_size, 
                                                     supervised_ratio=config.data.supervised_ratio, 
@@ -439,6 +439,10 @@ def test(config, model, model_dir, test_loader, criterion):
     iou_test_sum = 0
     loss_test_sum = 0
     num_test = 0
+    acc_test_sum = 0
+    sen_test_sum = 0
+    spe_test_sum = 0
+    pre_test_sum = 0
     for batch_id, batch in enumerate(test_loader):
         img = batch['image'].cuda().float()
         label = batch['label'].cuda().float()
@@ -459,38 +463,53 @@ def test(config, model, model_dir, test_loader, criterion):
             loss_test_sum += sum(losses)*batch_len
 
             # calculate metrics
-            output = output.cpu().numpy() > 0.5
-            label = label.cpu().numpy()
-            dice_test_sum += metrics.dc(output, label)*batch_len
-            iou_test_sum += metrics.jc(output, label)*batch_len
 
+            output_np = output.cpu().numpy() > 0.5
+            label_np = label.cpu().numpy()
+            dice_test_sum += metrics.dc(output_np, label_np)*batch_len
+            iou_test_sum += metrics.jc(output_np, label_np)*batch_len
+            output_bin = (output > 0.5).float().cpu()
+            label_bin = label.float().cpu()
+            seg_metrics = segmentation_metrics(output_bin, label_bin)
+            acc_test_sum += seg_metrics['ACC'] * batch_len
+            sen_test_sum += seg_metrics['SEN'] * batch_len
+            spe_test_sum += seg_metrics['SPE'] * batch_len
+            pre_test_sum += seg_metrics['PRE'] * batch_len
             num_test += batch_len
             # end one test batch
             if config.debug: break
 
     # logging results for one dataset
     loss_test_epoch, dice_test_epoch, iou_test_epoch = loss_test_sum/num_test, dice_test_sum/num_test, iou_test_sum/num_test
+    acc_test_epoch = acc_test_sum / num_test
+    sen_test_epoch = sen_test_sum / num_test
+    spe_test_epoch = spe_test_sum / num_test
+    pre_test_epoch = pre_test_sum / num_test
 
 
     # logging average and store results
     with open(test_results_dir, 'w') as f:
-        f.write(f'loss: {loss_test_epoch.item()}, Dice_score {dice_test_epoch}, IOU: {iou_test_epoch}')
+        f.write(f'loss: {loss_test_epoch.item()}, Dice_score {dice_test_epoch}, IOU: {iou_test_epoch}, ACC: {acc_test_epoch}, SEN: {sen_test_epoch}, SPE: {spe_test_epoch}, PRE: {pre_test_epoch}')
 
     # print
     file_log.write('========================================================================================\n')
-    file_log.write('Test || Average loss: {}, Dice score: {}, IOU: {}\n'.
+    file_log.write('Test || Average loss: {}, Dice score: {}, IOU: {}, ACC: {}, SEN: {}, SPE: {}, PRE: {}\n'.
                         format(round(loss_test_epoch.item(),5), 
-                        round(dice_test_epoch,4), round(iou_test_epoch,4)))
+                        round(dice_test_epoch,4), round(iou_test_epoch,4), round(acc_test_epoch,4), round(sen_test_epoch,4), round(spe_test_epoch,4), round(pre_test_epoch,4)))
     file_log.flush()
     print('========================================================================================')
-    print('Test || Average loss: {}, Dice score: {}, IOU: {}'.
+    print('Test || Average loss: {}, Dice score: {}, IOU: {}, ACC: {}, SEN: {}, SPE: {}, PRE: {}\n'.
             format(round(loss_test_epoch.item(),5), 
-            round(dice_test_epoch,4), round(iou_test_epoch,4)))
+            round(dice_test_epoch,4), round(iou_test_epoch,4), round(acc_test_epoch,4), round(sen_test_epoch,4), round(spe_test_epoch,4), round(pre_test_epoch,4)))
 
     wandb.log({
         "test/loss": loss_test_epoch.item(),
         "test/dice": dice_test_epoch,
-        "test/iou": iou_test_epoch
+        "test/iou": iou_test_epoch,
+        "test/acc": acc_test_epoch,
+        "test/sensitivity": sen_test_epoch,
+        "test/specificity": spe_test_epoch,
+        "test/precision": pre_test_epoch
     })
 
     return
